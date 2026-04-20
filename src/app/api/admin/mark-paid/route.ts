@@ -2,13 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { env } from "@/lib/env";
 import { supabaseAdmin } from "@/lib/supabase-admin";
-import { createDownloadToken } from "@/lib/download-token";
+import { sendOrderPaidEmail } from "@/lib/order-email";
+import { requireAdminFromRequest } from "@/lib/admin-access";
 
 const Body = z.object({ orderId: z.string().uuid() });
 
 export async function POST(request: NextRequest) {
   const auth = request.headers.get("x-admin-key") || "";
-  if (!env.ADMIN_API_KEY || auth !== env.ADMIN_API_KEY) {
+  const adminByKey = !!env.ADMIN_API_KEY && auth === env.ADMIN_API_KEY;
+
+  let adminByUser = false;
+  if (!adminByKey) {
+    const admin = await requireAdminFromRequest(request);
+    adminByUser = admin.ok;
+  }
+
+  if (!adminByKey && !adminByUser) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
@@ -19,20 +28,23 @@ export async function POST(request: NextRequest) {
 
   const orderId = parsed.data.orderId;
 
-  await supabaseAdmin
+  const { error: updateErr } = await supabaseAdmin
     .from("orders")
     .update({ status: "paid", paid_at: new Date().toISOString() })
     .eq("id", orderId);
 
-  const { data: orderItems } = await supabaseAdmin
-    .from("order_items")
-    .select("product_id")
-    .eq("order_id", orderId);
-
-  const tokens: string[] = [];
-  for (const it of orderItems || []) {
-    tokens.push(await createDownloadToken(orderId, it.product_id));
+  if (updateErr) {
+    return NextResponse.json({ error: updateErr.message }, { status: 500 });
   }
 
-  return NextResponse.json({ ok: true, orderId, tokens });
+  let emailResult: any = null;
+  let emailError: string | null = null;
+  try {
+    emailResult = await sendOrderPaidEmail({ orderId });
+  } catch (e: any) {
+    emailError = String(e?.message || e || "sendOrderPaidEmail failed");
+    console.error("[admin/mark-paid] sendOrderPaidEmail failed", e);
+  }
+
+  return NextResponse.json({ ok: true, orderId, email: emailResult, emailError });
 }
